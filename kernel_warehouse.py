@@ -1,14 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.autograd
 from itertools import repeat
 import collections.abc
 import math
 from functools import partial
 
-# ----------------------------
-# Helper function
-# ----------------------------
+# ---------------------- Utility ----------------------
 def parse(x, n):
     if isinstance(x, collections.abc.Iterable):
         if len(x) == 1:
@@ -20,20 +19,21 @@ def parse(x, n):
     else:
         return list(repeat(x, n))
 
-# ----------------------------
-# Attention Module
-# ----------------------------
+# ---------------------- Attention ----------------------
 class Attention(nn.Module):
-    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture, norm_layer=nn.BatchNorm1d,
-                 cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None):
+    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,
+                 norm_layer=nn.BatchNorm1d, cell_num_ratio=1.0,
+                 nonlocal_basis_ratio=1.0, start_cell_idx=None):
         super(Attention, self).__init__()
         hidden_planes = max(int(in_planes * reduction), 16)
         self.kw_planes_per_mixture = num_static_cell + 1
         self.num_local_mixture = num_local_mixture
         self.kw_planes = self.kw_planes_per_mixture * num_local_mixture
+
         self.num_local_cell = int(cell_num_ratio * num_local_mixture)
         self.num_nonlocal_cell = num_static_cell - self.num_local_cell
         self.start_cell_idx = start_cell_idx
+
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.fc1 = nn.Linear(in_planes, hidden_planes, bias=(norm_layer is not nn.BatchNorm1d))
         self.norm1 = norm_layer(hidden_planes)
@@ -95,17 +95,16 @@ class Attention(nn.Module):
         return x
 
     def forward(self, x):
-        x = self.avgpool(x.reshape(*x.shape[:2], -1)).squeeze(dim=-1)
+        device = x.device
+        x = self.avgpool(x.reshape(*x.shape[:2], -1)).squeeze(-1)
         x = self.act1(self.norm1(self.fc1(x)))
         x = self.map_to_cell(self.fc2(x)).reshape(-1, self.kw_planes_per_mixture)
         x = x / (torch.sum(torch.abs(x), dim=1).view(-1, 1) + 1e-3)
         x = (1.0 - self.temp_value) * x.reshape(-1, self.kw_planes) \
-            + self.temp_value * self.temp_bias.to(x.device).view(1, -1)  # <-- GPU safe
+            + self.temp_value * self.temp_bias.to(device).view(1, -1)
         return x.reshape(-1, self.kw_planes_per_mixture)[:, :-1]
 
-# ----------------------------
-# KWConvNd Base
-# ----------------------------
+# ---------------------- KWconvNd ----------------------
 class KWconvNd(nn.Module):
     dimension = None
     permute = None
@@ -123,15 +122,15 @@ class KWconvNd(nn.Module):
         self.groups = groups
         self.bias = nn.Parameter(torch.zeros([self.out_planes]), requires_grad=True).float() if bias else None
         self.warehouse_id = warehouse_id
-        self.warehouse_manager = [warehouse_manager]  # avoid repeat registration for warehouse manager
+        self.warehouse_manager = [warehouse_manager]
 
     def init_attention(self, cell, start_cell_idx, reduction, cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0):
-        self.cell_shape = cell.shape  # [M, C_out, C_in, D, H, W]
+        self.cell_shape = cell.shape
         self.groups_out_channel = self.out_planes // self.cell_shape[1]
         self.groups_in_channel = self.in_planes // self.cell_shape[2] // self.groups
         self.groups_spatial = 1
         for idx in range(len(self.kernel_size)):
-            self.groups_spatial = self.groups_spatial * self.kernel_size[idx] // self.cell_shape[3 + idx]
+            self.groups_spatial *= self.kernel_size[idx] // self.cell_shape[3 + idx]
         num_local_mixture = self.groups_out_channel * self.groups_in_channel * self.groups_spatial
         self.attention = Attention(self.in_planes, reduction, self.cell_shape[0], num_local_mixture,
                                    norm_layer=norm_layer, nonlocal_basis_ratio=nonlocal_basis_ratio,
@@ -139,27 +138,25 @@ class KWconvNd(nn.Module):
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
 
     def forward(self, x):
-        kw_attention = self.attention(x)
+        device = x.device
+        kw_attention = self.attention(x).to(device)
         batch_size = x.shape[0]
-        x = x.reshape(1, -1, *x.shape[2:])
-        # ---------------- GPU SAFE ----------------
-        weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1).to(x.device)
-        # -----------------------------------------
+        x = x.reshape(1, -1, *x.shape[2:]).to(device)
+        weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1).to(device)
         aggregate_weight = torch.mm(kw_attention, weight)
         aggregate_weight = aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
                                                      self.groups_in_channel, *self.cell_shape[1:]])
         aggregate_weight = aggregate_weight.permute(*self.permute)
         aggregate_weight = aggregate_weight.reshape(-1, self.in_planes // self.groups, *self.kernel_size)
-        output = self.func_conv(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+        output = self.func_conv(x, weight=aggregate_weight, bias=None,
+                                stride=self.stride, padding=self.padding,
                                 dilation=self.dilation, groups=self.groups * batch_size)
         output = output.view(batch_size, self.out_planes, *output.shape[2:])
         if self.bias is not None:
-            output = output + self.bias.reshape(1, -1, *([1]*self.dimension))
+            output = output + self.bias.reshape(1, -1, *([1]*self.dimension)).to(device)
         return output
 
-# ----------------------------
-# KWConvNd Variants
-# ----------------------------
+# ---------------------- KWConv subclasses ----------------------
 class KWConv1d(KWconvNd):
     dimension = 1
     permute = (0, 2, 4, 3, 5, 1, 6)
@@ -175,24 +172,18 @@ class KWConv3d(KWconvNd):
     permute = (0, 2, 4, 3, 5, 1, 6, 7, 8)
     func_conv = F.conv3d
 
-# ----------------------------
-# KWLinear Wrapper
-# ----------------------------
 class KWLinear(nn.Module):
     dimension = 1
     def __init__(self, *args, **kwargs):
         super(KWLinear, self).__init__()
         self.conv = KWConv1d(*args, **kwargs)
-
     def forward(self, x):
         shape = x.shape
         x = self.conv(x.reshape(shape[0], -1, shape[-1]).transpose(1, 2))
         x = x.transpose(1, 2).reshape(*shape[:-1], -1)
         return x
 
-# ----------------------------
-# Warehouse Manager
-# ----------------------------
+# ---------------------- Warehouse Manager ----------------------
 class Warehouse_Manager(nn.Module):
     def __init__(self, reduction=0.0625, cell_num_ratio=1, cell_inplane_ratio=1,
                  cell_outplane_ratio=1, sharing_range=(), nonlocal_basis_ratio=1,
@@ -222,22 +213,20 @@ class Warehouse_Manager(nn.Module):
                 bias=True, warehouse_name='default', enabled=True, layer_type='conv2d'):
         kw_mapping = {'conv1d': KWConv1d, 'conv2d': KWConv2d, 'conv3d': KWConv3d, 'linear': KWLinear}
         org_mapping = {'conv1d': nn.Conv1d, 'conv2d': nn.Conv2d, 'conv3d': nn.Conv3d, 'linear': nn.Linear}
-
         if not enabled:
             layer_type = org_mapping[layer_type]
             if layer_type is nn.Linear:
                 return layer_type(in_planes, out_planes, bias=bias)
             else:
-                return layer_type(in_planes, out_planes, kernel_size, stride=stride, padding=padding, dilation=dilation,
-                                  groups=groups, bias=bias)
+                return layer_type(in_planes, out_planes, kernel_size, stride=stride, padding=padding,
+                                  dilation=dilation, groups=groups, bias=bias)
         else:
             layer_type = kw_mapping[layer_type]
             warehouse_name = self.fuse_warehouse_name(warehouse_name)
             weight_shape = [out_planes, in_planes // groups, *parse(kernel_size, layer_type.dimension)]
-            if warehouse_name not in self.warehouse_list:
+            if warehouse_name not in self.warehouse_list.keys():
                 self.warehouse_list[warehouse_name] = []
             self.warehouse_list[warehouse_name].append(weight_shape)
-
             return layer_type(in_planes, out_planes, kernel_size, stride=stride, padding=padding,
                               dilation=dilation, groups=groups, bias=bias,
                               warehouse_id=int(list(self.warehouse_list.keys()).index(warehouse_name)),
@@ -251,7 +240,6 @@ class Warehouse_Manager(nn.Module):
         self.cell_outplane_ratio = parse(self.cell_outplane_ratio, len(warehouse_names))
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.weights = nn.ParameterList()
-
         for idx, warehouse_name in enumerate(self.warehouse_list.keys()):
             warehouse = self.warehouse_list[warehouse_name]
             dimension = len(warehouse[0]) - 2
@@ -264,16 +252,14 @@ class Warehouse_Manager(nn.Module):
             cell_in_plane = max(int(in_plane_gcd * self.cell_inplane_ratio[idx]), 1)
             cell_out_plane = max(int(out_plane_gcd * self.cell_outplane_ratio[idx]), 1)
             cell_kernel_size = parse(1, dimension) if self.spatial_partition[idx] else kernel_size
-
             num_total_mixtures = 0
             for layer in warehouse:
                 groups_channel = int(layer[0] // cell_out_plane * layer[1] // cell_in_plane)
                 groups_spatial = 1
                 for d in range(dimension):
-                    groups_spatial = int(groups_spatial * layer[2 + d] // cell_kernel_size[d])
+                    groups_spatial *= layer[2 + d] // cell_kernel_size[d]
                 num_layer_mixtures = groups_spatial * groups_channel
                 num_total_mixtures += num_layer_mixtures
-
             self.weights.append(nn.Parameter(torch.randn(
                 max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
                 cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
@@ -281,7 +267,6 @@ class Warehouse_Manager(nn.Module):
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
         end_idxs = [0] * num_warehouse
-
         for layer in network.modules():
             if isinstance(layer, KWconvNd):
                 warehouse_idx = layer.warehouse_id
@@ -295,10 +280,8 @@ class Warehouse_Manager(nn.Module):
                 _init_weights(self.weights[warehouse_idx][start_cell_idx:end_cell_idx].view(
                     -1, *self.weights[warehouse_idx].shape[2:]))
                 end_idxs[warehouse_idx] = end_cell_idx
-
         for warehouse_idx in range(len(end_idxs)):
             assert end_idxs[warehouse_idx] == self.weights[warehouse_idx].shape[0]
 
     def take_cell(self, warehouse_idx):
         return self.weights[warehouse_idx]
-
