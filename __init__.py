@@ -1,1 +1,2 @@
-from kernel_warehouse import KWconvNd
+from kernel_warehouse import KWConvNd
+from kernel_warehouse import Warehouse_Manager
